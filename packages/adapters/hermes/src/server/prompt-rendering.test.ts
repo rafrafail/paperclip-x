@@ -244,7 +244,8 @@ test("renders safe Paperclip API examples from environment variables with multil
   expect(prompt).toContain('-H "Authorization: Bearer $PAPERCLIP_API_KEY"');
   expect(prompt).toContain('-H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"');
   expect(prompt).toContain("body=$(cat <<'MD'");
-  expect(prompt).toContain("jq -n --arg status done --arg comment \"$body\"");
+  expect(prompt).toContain("jq -n --arg status done --arg comment \"$body\" --arg summary \"$body\"");
+  expect(prompt).toContain("terminalHandoff:{outcome:\"passed\"");
   expect(prompt).toContain("--data-binary @-");
   expect(prompt).not.toContain("Authorization: Bearer <");
 });

@@ -111,7 +111,7 @@ const HERMES_DEFAULT_PROMPT_TEMPLATE = [
   "- Detail two",
   "MD",
   ")",
-  "jq -n --arg status done --arg comment \"$body\" '{status:$status, comment:$comment}' | \\",
+  "jq -n --arg status done --arg comment \"$body\" --arg summary \"$body\" '{status:$status, comment:$comment, terminalHandoff:{outcome:\"passed\",summary:$summary,tests:[\"describe the verification run\"]}}' | \\",
   "  curl -sS -X PATCH \"$api/issues/{{context.issueId}}\" \\",
   "    -H \"Authorization: Bearer $PAPERCLIP_API_KEY\" \\",
   "    -H \"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\" \\",

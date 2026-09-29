@@ -453,7 +453,7 @@ function buildWakeText(
     "   - For plan approval, update the plan document first, then create request_confirmation targeting the latest plan revision with idempotencyKey confirmation:{issueId}:plan:{revisionId}; wait for acceptance before creating implementation subtasks.",
     "   - If blocked, PATCH /api/issues/{issueId} with {\"status\":\"blocked\",\"comment\":\"what is blocked, who owns the unblock, and the next action\"}.",
     "   - If instructions require a comment, POST /api/issues/{issueId}/comments with {\"body\":\"...\"}.",
-    "   - PATCH /api/issues/{issueId} with {\"status\":\"done\",\"comment\":\"what changed and why\"}.",
+    "   - PATCH /api/issues/{issueId} with {\"status\":\"done\",\"comment\":\"what changed and why\",\"terminalHandoff\":{\"outcome\":\"passed\",\"summary\":\"what changed and why\",\"tests\":[\"verification command and result\"]}}. Comments alone do not prove completion.",
     "4) If issueId does not exist:",
     "   - GET /api/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=$PAPERCLIP_AGENT_ID&status=todo,in_progress,in_review,blocked",
     "   - Pick in_progress first, then in_review when you were woken by a comment, then todo, then blocked, then execute step 3.",
