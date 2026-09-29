@@ -13001,8 +13001,8 @@ export function issueRoutes(
           res,
           existing.companyId,
           existing,
-        ))
-      ) {
+        ))) {
+
         return;
       }
       if (
