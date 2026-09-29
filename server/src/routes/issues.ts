@@ -657,6 +657,7 @@ function buildCreateIssueActivityStatusDetails(
 }
 
 const SUCCESSFUL_RUN_HANDOFF_ACTIONS = [
+  "issue.execution_handoff_confirmed",
   "issue.successful_run_handoff_required",
   "issue.successful_run_handoff_resolved",
   "issue.successful_run_handoff_escalated",
@@ -1069,13 +1070,15 @@ function successfulRunHandoffStateFromActivity(row: {
 }): SuccessfulRunHandoffState | null {
   const details = row.details ?? {};
   const state =
-    row.action === "issue.successful_run_handoff_required"
-      ? "required"
-      : row.action === "issue.successful_run_handoff_resolved"
-        ? "resolved"
-        : row.action === "issue.successful_run_handoff_escalated"
-          ? "escalated"
-          : null;
+    row.action === "issue.execution_handoff_confirmed"
+      ? "confirmed"
+      : row.action === "issue.successful_run_handoff_required"
+        ? "required"
+        : row.action === "issue.successful_run_handoff_resolved"
+          ? "resolved"
+          : row.action === "issue.successful_run_handoff_escalated"
+            ? "escalated"
+            : null;
   if (!state) return null;
 
   const detectedProgressSummary =
@@ -1104,6 +1107,20 @@ function successfulRunHandoffStateFromActivity(row: {
       null,
     detectedProgressSummary: detectedProgressSummary
       ? redactSensitiveText(detectedProgressSummary)
+      : null,
+    outcome: ["passed", "request_changes", "blocked", "failed"].includes(String(details.outcome))
+      ? details.outcome as SuccessfulRunHandoffState["outcome"]
+      : null,
+    summary: readNonEmptyString(details.summary)
+      ? redactSensitiveText(readNonEmptyString(details.summary)!)
+      : null,
+    sha: readNonEmptyString(details.sha),
+    pr: readNonEmptyString(details.pr),
+    tests: Array.isArray(details.tests)
+      ? details.tests.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : null,
+    artifacts: Array.isArray(details.artifacts)
+      ? details.artifacts.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       : null,
     createdAt: row.createdAt,
   };
@@ -12869,25 +12886,19 @@ export function issueRoutes(
       );
       if (!issueMutationAccess) return;
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
-      const issueMutationAuthorizationReason =
-        req.actor.type === "agent"
-          ? issueWriteAuthorizationReason(
-              req,
-              await decideIssueAccess(req, existing, "issue:mutate"),
-            )
-          : issueWriteAuthorizationReason(req, true);
+      const issueMutationAuthorizationReason = req.actor.type === "agent"
+        ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
+        : issueWriteAuthorizationReason(req, true);
 
       const actor = getActorInfo(req);
       const isClosed = isClosedIssueStatus(existing.status);
       const isBlocked = existing.status === "blocked";
-      const normalizedAssigneeAgentId =
-        await normalizeIssueAssigneeAgentReference(
-          existing.companyId,
-          req.body.assigneeAgentId as string | null | undefined,
-          { actorType: req.actor.type },
-        );
-      const titleOrDescriptionChanged =
-        req.body.title !== undefined || req.body.description !== undefined;
+      const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+        existing.companyId,
+        req.body.assigneeAgentId as string | null | undefined,
+        { actorType: req.actor.type },
+      );
+      const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
       const existingRelations = Array.isArray(req.body.blockedByIssueIds)
         ? await svc.getRelationSummaries(existing.id)
         : null;
@@ -12902,6 +12913,7 @@ export function issueRoutes(
         interrupt: interruptRequested,
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
+        terminalHandoff,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -12940,6 +12952,29 @@ export function issueRoutes(
         req.body.reviewPolicy !== undefined ||
         updateFields.status === "done" ||
         updateFields.status === "cancelled";
+      const agentCompletingActiveRun =
+        req.actor.type === "agent" &&
+        existing.status !== "done" &&
+        updateFields.status === "done";
+      if (agentCompletingActiveRun) {
+        if (!actor.runId || existing.executionRunId !== actor.runId) {
+          res
+            .status(409)
+            .json({ error: "Agents may only complete the issue execution run they own" });
+          return;
+        }
+        if (!terminalHandoff || terminalHandoff.outcome !== "passed") {
+          res
+            .status(422)
+            .json({ error: "Completing an execution run requires a passed terminalHandoff" });
+          return;
+        }
+      } else if (terminalHandoff) {
+        res
+          .status(422)
+          .json({ error: "terminalHandoff is only valid when an agent completes its active execution run" });
+        return;
+      }
       if (
         (reviewVerdictRequested || reviewPolicyChangeRequested) &&
         existing.reviewPolicy != null &&
@@ -13691,6 +13726,37 @@ export function issueRoutes(
           postCommitActivityPublications,
         );
       };
+      const persistTerminalHandoff = async (
+        tx: Parameters<typeof svc.update>[2],
+        updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
+      ) => {
+        if (!terminalHandoff || !actor.runId) return;
+        await logActivity(
+          tx as unknown as Db,
+          {
+            companyId: updated.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.execution_handoff_confirmed",
+            entityType: "issue",
+            entityId: updated.id,
+            details: {
+              sourceRunId: actor.runId,
+              assigneeAgentId: actor.agentId,
+              outcome: terminalHandoff.outcome,
+              summary: terminalHandoff.summary,
+              sha: terminalHandoff.sha ?? null,
+              pr: terminalHandoff.pr ?? null,
+              tests: terminalHandoff.tests ?? [],
+              artifacts: terminalHandoff.artifacts ?? [],
+            },
+          },
+          postCommitActivityPublications,
+        );
+      };
       // Reopen the closed isolated workspace only after every access, validation,
       // and policy gate passes, and just before the update persists. A rejected
       // update must not rebuild and republish the workspace as active, because the
@@ -13745,6 +13811,7 @@ export function issueRoutes(
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
+        Boolean(terminalHandoff) ||
         reviewPolicySensitiveMutationRequested;
       try {
         if (shouldUseTransactionalIssueUpdate) {
@@ -13802,6 +13869,7 @@ export function issueRoutes(
               );
             }
 
+            await persistTerminalHandoff(tx, updated);
             await persistReviewTransitionActivity(tx, updated);
 
             return updated;

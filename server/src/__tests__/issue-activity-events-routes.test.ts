@@ -21,7 +21,9 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(async () => false),
   hasPermission: vi.fn(async () => false),
+  decide: vi.fn(async () => ({ allowed: true })),
 }));
+const mockResolveTaskWatchdogMutationScope = vi.hoisted(() => vi.fn(async () => ({ kind: "none" })));
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
@@ -74,6 +76,10 @@ function registerModuleMocks() {
 
   vi.doMock("../services/issues.js", () => ({
     issueService: () => mockIssueService,
+  }));
+
+  vi.doMock("../services/task-watchdog-scope.js", () => ({
+    resolveTaskWatchdogMutationScope: mockResolveTaskWatchdogMutationScope,
   }));
 
   vi.doMock("../services/routines.js", () => ({
@@ -136,7 +142,16 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: unknown = {}) {
+async function createApp(
+  db: unknown = {},
+  actor: Record<string, unknown> = {
+    type: "board",
+    userId: "local-board",
+    companyIds: ["company-1"],
+    source: "local_implicit",
+    isInstanceAdmin: false,
+  },
+) {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -144,13 +159,7 @@ async function createApp(db: unknown = {}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes(db as any, {} as any));
@@ -546,6 +555,30 @@ describe("issue activity event routes", () => {
         }),
       );
     });
+  });
+
+  it("rejects an agent completion without a typed handoff before it changes the issue", async () => {
+    const issue = {
+      ...makeIssue(),
+      status: "in_progress",
+      executionRunId: "run-451",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({}, {
+      type: "agent",
+      agentId: issue.assigneeAgentId,
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      source: "agent_key",
+      runId: "run-451",
+    }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "done" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe("Completing an execution run requires a passed terminalHandoff");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("logs successful_run_handoff_resolved when an in_progress issue transitions to done with a pending required handoff", async () => {

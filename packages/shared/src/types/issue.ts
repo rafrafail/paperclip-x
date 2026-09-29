@@ -572,7 +572,8 @@ export interface IssueRecoveryAction {
   updatedAt: Date | string;
 }
 
-export type SuccessfulRunHandoffStateKind = "required" | "resolved" | "escalated";
+export type SuccessfulRunHandoffStateKind = "confirmed" | "required" | "resolved" | "escalated";
+export type SuccessfulRunHandoffOutcome = "passed" | "request_changes" | "blocked" | "failed";
 
 export interface SuccessfulRunHandoffState {
   state: SuccessfulRunHandoffStateKind;
@@ -583,6 +584,12 @@ export interface SuccessfulRunHandoffState {
   correctiveRunId: string | null;
   assigneeAgentId: string | null;
   detectedProgressSummary: string | null;
+  outcome?: SuccessfulRunHandoffOutcome | null;
+  summary?: string | null;
+  sha?: string | null;
+  pr?: string | null;
+  tests?: string[] | null;
+  artifacts?: string[] | null;
   createdAt: Date | string | null;
 }
 

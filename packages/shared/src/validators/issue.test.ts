@@ -152,6 +152,31 @@ describe("issue validators", () => {
     expect(parsed.comment).toBe("Done\n\n- Verified the route");
   });
 
+  it("accepts only structured terminal handoffs", () => {
+    expect(updateIssueSchema.parse({
+      status: "done",
+      terminalHandoff: {
+        outcome: "passed",
+        summary: "All checks passed",
+        sha: "ba81075",
+        tests: ["pnpm test"],
+      },
+    }).terminalHandoff).toEqual({
+      outcome: "passed",
+      summary: "All checks passed",
+      sha: "ba81075",
+      tests: ["pnpm test"],
+    });
+    expect(updateIssueSchema.safeParse({
+      status: "done",
+      terminalHandoff: { outcome: "passed", summary: "" },
+    }).success).toBe(false);
+    expect(updateIssueSchema.safeParse({
+      status: "done",
+      terminalHandoff: { outcome: "passed", summary: "ok", unknown: true },
+    }).success).toBe(false);
+  });
+
   it("validates structured unblock descriptors", () => {
     expect(
       updateIssueSchema.parse({

@@ -1130,6 +1130,7 @@ export type {
   IssueWatchdogSummary,
   SuccessfulRunHandoffState,
   SuccessfulRunHandoffStateKind,
+  SuccessfulRunHandoffOutcome,
   IssueScheduledRetry,
   IssueScheduledRetryStatus,
   IssueRetryNowOutcome,

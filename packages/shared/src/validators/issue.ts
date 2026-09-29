@@ -850,6 +850,22 @@ const issueCommentAttachmentIdsSchema = z
     message: "Attachment ids must be unique",
   });
 
+export const issueTerminalHandoffSchema = z
+  .object({
+    outcome: z.enum(["passed", "request_changes", "blocked", "failed"]),
+    summary: multilineTextSchema.pipe(z.string().trim().min(1).max(8_000)),
+    sha: z.string().trim().min(1).max(128).optional(),
+    pr: z.string().trim().url().max(2_000).optional(),
+    tests: z.array(z.string().trim().min(1).max(2_000)).max(100).optional(),
+    artifacts: z
+      .array(z.string().trim().min(1).max(2_000))
+      .max(100)
+      .optional(),
+  })
+  .strict();
+
+export type IssueTerminalHandoff = z.infer<typeof issueTerminalHandoffSchema>;
+
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     createdByUserId: true,
@@ -874,6 +890,7 @@ export const updateIssueSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
+    terminalHandoff: issueTerminalHandoffSchema.optional(),
   });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
