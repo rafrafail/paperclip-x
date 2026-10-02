@@ -12,6 +12,12 @@ import {
   agentWakeupRequests,
   activityLog,
   costEvents,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisionTriage,
+  decisionTriageEvents,
+  financeEvents,
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
@@ -1079,6 +1085,17 @@ export function agentService(db: Db) {
         );
         await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
         await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
+        // These FKs to heartbeat_runs have no ON DELETE action; keep the rows and drop only the run link.
+        const agentRunIds = sql`(select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`;
+        await tx.delete(heartbeatRunEvents).where(sql`${heartbeatRunEvents.runId} in ${agentRunIds}`);
+        await tx.update(costEvents).set({ heartbeatRunId: null }).where(sql`${costEvents.heartbeatRunId} in ${agentRunIds}`);
+        await tx.update(financeEvents).set({ heartbeatRunId: null }).where(sql`${financeEvents.heartbeatRunId} in ${agentRunIds}`);
+        await tx.update(agentTaskSessions).set({ lastRunId: null }).where(sql`${agentTaskSessions.lastRunId} in ${agentRunIds}`);
+        await tx.update(decisionQueues).set({ createdByRunId: null }).where(sql`${decisionQueues.createdByRunId} in ${agentRunIds}`);
+        await tx.update(decisionQueueItems).set({ addedByRunId: null }).where(sql`${decisionQueueItems.addedByRunId} in ${agentRunIds}`);
+        await tx.update(decisionTriage).set({ setByRunId: null }).where(sql`${decisionTriage.setByRunId} in ${agentRunIds}`);
+        await tx.update(decisionTriageEvents).set({ actorRunId: null }).where(sql`${decisionTriageEvents.actorRunId} in ${agentRunIds}`);
+        await tx.update(decisionRetention).set({ archivedByRunId: null }).where(sql`${decisionRetention.archivedByRunId} in ${agentRunIds}`);
         await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
         await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
