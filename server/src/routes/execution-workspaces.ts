@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants as fsConstants, existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
@@ -1142,6 +1142,9 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
   // issues, host-executed commands, or metadata, and it fails closed unless the
   // prepared path is an existing directory strictly inside the project's own
   // `_work/` tree with the project's exact repository URL.
+  // Registration is a record only: it does not serialize concurrent reviewer
+  // dispatch. Dispatch exclusivity is owned by the registering connector's
+  // local reservation, not by this server-side record.
   router.post("/projects/:id/execution-workspaces", validate(registerPreparedExecutionWorkspaceSchema), async (req, res) => {
     const id = req.params.id as string;
     const projectRows = await db
@@ -1172,24 +1175,95 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       status?: "idle" | "in_review";
       name?: string;
     };
+    const primaryCwd = primary.cwd;
     // The prepared checkout must live strictly inside this project's own
     // `_work/` tree, derived from the primary checkout's repository root (the
     // path before any managed nested-checkout marker). Anything else — another
     // project's tree, the shared workspace root, or the primary checkout
     // itself — is rejected.
-    const primarySegments = primary.cwd.split("/").filter((segment) => segment.length > 0);
-    const markerIndex = primarySegments.findIndex(
-      (segment) => segment === "_work" || segment === ".worktrees" || segment === ".paperclip",
-    );
-    const repoSegments = markerIndex > 0 ? primarySegments.slice(0, markerIndex) : primarySegments;
-    const workRoot = repoSegments.length >= 2 ? `/${repoSegments.join("/")}/_work` : null;
-    if (!workRoot || payload.cwd === workRoot || !payload.cwd.startsWith(`${workRoot}/`)) {
+    //
+    // The boundary is enforced on canonically resolved paths, not lexical
+    // prefixes: the primary checkout root and the prepared path are resolved
+    // with realpathSync, so a cwd that merely *spells* a path inside `_work/`
+    // but resolves through a symlink (its own final segment or any ancestor,
+    // including an ancestor alias of the repository root itself) to a
+    // directory outside the canonical work tree is rejected. This is a
+    // privileged operator registration boundary: the server deliberately does
+    // not revalidate Git state (identity is enforced by the exact repoUrl
+    // comparison below); the registering connector owns the Git proof.
+    const resolveWorkRootBoundary = (): { workRoot: string | null; error: string | null } => {
+      const primarySegments = primaryCwd.split("/").filter((segment) => segment.length > 0);
+      const markerIndex = primarySegments.findIndex(
+        (segment) => segment === "_work" || segment === ".worktrees" || segment === ".paperclip",
+      );
+      const repoSegments = markerIndex > 0 ? primarySegments.slice(0, markerIndex) : primarySegments;
+      const lexicalWorkRoot = repoSegments.length >= 2 ? `/${repoSegments.join("/")}/_work` : null;
+      if (!lexicalWorkRoot) {
+        return { workRoot: null, error: "unresolvable project root" };
+      }
+      // Resolve the canonical repository root. The primary cwd is stored in
+      // realized form by the managed-workspace identity layer, but any stored
+      // path is re-anchored here so an aliased or relocated checkout cannot
+      // widen the boundary.
+      let canonicalRepoRoot: string;
+      try {
+        canonicalRepoRoot = realpathSync(`/${repoSegments.join("/")}`);
+      } catch {
+        return { workRoot: null, error: "primary checkout root is not resolvable on the server host" };
+      }
+      const canonicalWorkRoot = `${canonicalRepoRoot}/_work`;
+      return { workRoot: canonicalWorkRoot, error: null };
+    };
+    const { workRoot, error: workRootError } = resolveWorkRootBoundary();
+    if (!workRoot) {
       res.status(422).json({
-        error: `Prepared execution workspace cwd must be strictly inside this project's own ${workRoot ?? "<unresolvable project root>"}/ tree`,
+        error: `Prepared execution workspace cwd must be strictly inside this project's own _work/ tree: ${workRootError}`,
       });
       return;
     }
-    if (payload.cwd === primary.cwd) {
+    let canonicalCwd: string | null = null;
+    try {
+      canonicalCwd = realpathSync(payload.cwd);
+    } catch {
+      canonicalCwd = null;
+    }
+    if (canonicalCwd === null) {
+      res.status(422).json({
+        error: "Prepared execution workspace path does not exist as a directory on the server host; prepare the detached checkout before registration",
+      });
+      return;
+    }
+    if (canonicalCwd === workRoot || !canonicalCwd.startsWith(`${workRoot}/`)) {
+      // The canonicalized target lies outside the canonical work tree: this is
+      // the symlink-escape shape (a spelling inside `_work/` that resolves
+      // through its own final segment or any ancestor to a directory outside).
+      res.status(422).json({
+        error: `Prepared execution workspace cwd must be strictly inside this project's own ${workRoot}/ tree (resolved through symlinks to ${canonicalCwd})`,
+      });
+      return;
+    }
+    if (canonicalCwd !== payload.cwd) {
+      // The canonical target is inside the work tree but the spelled path goes
+      // through a symlink or aliased ancestor. The registration record is the
+      // workspace identity and the idempotency key, so it must carry the
+      // canonical path; alias spellings would let one physical checkout
+      // register twice.
+      res.status(422).json({
+        error: "Prepared execution workspace cwd must be spelled in canonical, symlink-resolved form inside this project's own _work/ tree; symlinks or aliased ancestors are not registerable",
+        canonicalCwd,
+      });
+      return;
+    }
+    // Compare the physical primary checkout too: its stored path may use an
+    // alias while the prepared payload is already canonical.
+    let canonicalPrimaryCwd: string;
+    try {
+      canonicalPrimaryCwd = realpathSync(primary.cwd);
+    } catch {
+      res.status(422).json({ error: "Project primary checkout is not resolvable on the server host" });
+      return;
+    }
+    if (canonicalCwd === canonicalPrimaryCwd) {
       res.status(422).json({
         error: "The project's primary checkout cannot be registered as an independent prepared execution workspace",
       });
@@ -1259,6 +1333,17 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       return;
     }
     const actor = getActorInfo(req);
+    // Audit-boundary contract: the registration row commits in the service
+    // transaction above, and this mandatory audit write happens after it. If
+    // the audit write fails the route surfaces 500 while the registration is
+    // already persisted — an unknown outcome for the caller, not a definite
+    // rejection. The registered path is the natural idempotency key: retrying
+    // the same payload re-reads the committed row (200, same id, no duplicate)
+    // and re-attempts the audit write. Callers must reconcile ambiguous 5xx by
+    // lookup against the same cwd, never by blind-creating a replacement
+    // workspace. The audit write is deliberately not suppressed or made
+    // best-effort: activity logging for mutating actions is a control-plane
+    // invariant.
     await logActivity(db, {
       companyId: accessible.companyId,
       actorType: actor.actorType,
