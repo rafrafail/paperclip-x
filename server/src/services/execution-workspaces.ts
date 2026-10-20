@@ -2892,6 +2892,86 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return row ? toExecutionWorkspace(row) : null;
     },
 
+    // Register an operator-prepared, already-realized execution workspace
+    // (detached git worktree at an exact commit). Serialized by an advisory
+    // lock on (companyId, cwd) so concurrent registrations cannot create
+    // duplicate rows for the same path; the in-transaction re-check makes the
+    // operation idempotent. The caller is responsible for payload/project
+    // validation and authorization; this method only persists the prepared
+    // identity exactly as given.
+    registerPreparedExecutionWorkspace: async (input: {
+      companyId: string;
+      projectId: string;
+      projectWorkspaceId: string | null;
+      cwd: string;
+      repoUrl: string;
+      baseRef: string;
+      name: string;
+      status: "idle" | "in_review";
+    }): Promise<{ workspace: ExecutionWorkspace; created: boolean }> => {
+      const lockKey = `${input.companyId}:${input.cwd}`;
+      return db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`,
+        );
+        const existingRows = await tx
+          .select()
+          .from(executionWorkspaces)
+          .where(
+            and(
+              eq(executionWorkspaces.companyId, input.companyId),
+              eq(executionWorkspaces.cwd, input.cwd),
+            ),
+          )
+          .orderBy(desc(executionWorkspaces.createdAt))
+          .limit(1);
+        const existing = existingRows[0] ?? null;
+        if (existing) {
+          return { workspace: toExecutionWorkspace(existing), created: false };
+        }
+        const now = new Date();
+        const insertedRows = await tx
+          .insert(executionWorkspaces)
+          .values({
+            companyId: input.companyId,
+            projectId: input.projectId,
+            projectWorkspaceId: input.projectWorkspaceId,
+            sourceIssueId: null,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: input.name,
+            status: input.status,
+            cwd: input.cwd,
+            repoUrl: input.repoUrl,
+            baseRef: input.baseRef,
+            branchName: null,
+            providerType: "git_worktree",
+            providerRef: input.cwd,
+            openedAt: now,
+            metadata: {
+              workspaceRealization: {
+                authoritativeRoot: input.cwd,
+                local: { path: input.cwd, worktreePath: input.cwd },
+              },
+              workspaceRealizationRequest: {
+                source: { localPath: input.cwd, worktreePath: input.cwd },
+              },
+              preparedWorkspaceRegistration: {
+                baseRef: input.baseRef,
+                registeredVia: "api",
+                registeredAt: now.toISOString(),
+              },
+            },
+          })
+          .returning();
+        const inserted = insertedRows[0];
+        if (!inserted) {
+          throw new Error("Prepared execution workspace registration insert returned no row");
+        }
+        return { workspace: toExecutionWorkspace(inserted), created: true };
+      });
+    },
+
     update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
       const row = await db
         .update(executionWorkspaces)
