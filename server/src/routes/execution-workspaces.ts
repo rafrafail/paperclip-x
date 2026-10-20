@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
@@ -9,6 +9,7 @@ import {
   findWorkspaceCommandDefinition,
   matchWorkspaceRuntimeServiceToCommand,
   reconcileExecutionWorkspaceBranchSchema,
+  registerPreparedExecutionWorkspaceSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
@@ -1133,6 +1134,149 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     }
 
     res.json(result);
+  });
+
+  // Register an operator-prepared, already-realized execution workspace as a
+  // record. Bounded, registration-only companion to the heartbeat-owned create
+  // path: it never realizes git state itself, never accepts branches, source
+  // issues, host-executed commands, or metadata, and it fails closed unless the
+  // prepared path is an existing directory strictly inside the project's own
+  // `_work/` tree with the project's exact repository URL.
+  router.post("/projects/:id/execution-workspaces", validate(registerPreparedExecutionWorkspaceSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const projectRows = await db
+      .select()
+      .from(projects)
+      .where(eq(projects.id, id))
+      .limit(1);
+    const project = projectRows[0] ?? null;
+    const accessible = await getAccessibleResource(req, res, Promise.resolve(project), "Project not found");
+    if (!accessible) return;
+    if (!(await assertRuntimeManageAllowed(req, res, accessible.companyId))) return;
+
+    const primaryRows = await db
+      .select()
+      .from(projectWorkspaces)
+      .where(and(eq(projectWorkspaces.projectId, id), eq(projectWorkspaces.isPrimary, true)));
+    const primary = primaryRows.length === 1 ? primaryRows[0] : null;
+    if (!primary?.cwd || !primary.repoUrl) {
+      res.status(422).json({
+        error: "Project has no single primary workspace carrying cwd and repoUrl; cannot anchor a prepared execution workspace",
+      });
+      return;
+    }
+    const payload = req.body as {
+      cwd: string;
+      repoUrl: string;
+      baseRef: string;
+      status?: "idle" | "in_review";
+      name?: string;
+    };
+    // The prepared checkout must live strictly inside this project's own
+    // `_work/` tree, derived from the primary checkout's repository root (the
+    // path before any managed nested-checkout marker). Anything else — another
+    // project's tree, the shared workspace root, or the primary checkout
+    // itself — is rejected.
+    const primarySegments = primary.cwd.split("/").filter((segment) => segment.length > 0);
+    const markerIndex = primarySegments.findIndex(
+      (segment) => segment === "_work" || segment === ".worktrees" || segment === ".paperclip",
+    );
+    const repoSegments = markerIndex > 0 ? primarySegments.slice(0, markerIndex) : primarySegments;
+    const workRoot = repoSegments.length >= 2 ? `/${repoSegments.join("/")}/_work` : null;
+    if (!workRoot || payload.cwd === workRoot || !payload.cwd.startsWith(`${workRoot}/`)) {
+      res.status(422).json({
+        error: `Prepared execution workspace cwd must be strictly inside this project's own ${workRoot ?? "<unresolvable project root>"}/ tree`,
+      });
+      return;
+    }
+    if (payload.cwd === primary.cwd) {
+      res.status(422).json({
+        error: "The project's primary checkout cannot be registered as an independent prepared execution workspace",
+      });
+      return;
+    }
+    // Repository identity must already be deliberately reconciled: the
+    // prepared record carries exactly the primary workspace's repository URL.
+    if (payload.repoUrl !== primary.repoUrl) {
+      res.status(422).json({
+        error: "Prepared execution workspace repoUrl differs from the project primary workspace repoUrl; reconcile the project record or the prepared remote deliberately before registration",
+        expectedRepoUrl: primary.repoUrl,
+        receivedRepoUrl: payload.repoUrl,
+      });
+      return;
+    }
+    let isPreparedDirectory = false;
+    try {
+      isPreparedDirectory = existsSync(payload.cwd) && statSync(payload.cwd).isDirectory();
+    } catch {
+      isPreparedDirectory = false;
+    }
+    if (!isPreparedDirectory) {
+      res.status(422).json({
+        error: "Prepared execution workspace path does not exist as a directory on the server host; prepare the detached checkout before registration",
+      });
+      return;
+    }
+
+    const registration = await svc.registerPreparedExecutionWorkspace({
+      companyId: accessible.companyId,
+      projectId: accessible.id,
+      projectWorkspaceId: primary.id,
+      cwd: payload.cwd,
+      repoUrl: payload.repoUrl,
+      baseRef: payload.baseRef,
+      name: payload.name ?? `prepared-${path.basename(payload.cwd)}-${payload.baseRef.slice(0, 8)}`,
+      status: payload.status ?? "idle",
+    });
+    const workspace = registration.workspace;
+    const matchesRequest = (
+      workspace.projectId === accessible.id
+      && workspace.mode === "isolated_workspace"
+      && workspace.strategyType === "git_worktree"
+      && workspace.providerType === "git_worktree"
+      && workspace.providerRef === payload.cwd
+      && workspace.repoUrl === payload.repoUrl
+      && workspace.baseRef === payload.baseRef
+      && workspace.branchName == null
+      && workspace.sourceIssueId == null
+      && workspace.closedAt == null
+      && (workspace.status === "idle" || workspace.status === "in_review" || workspace.status === "active")
+    );
+    if (!matchesRequest) {
+      res.status(409).json({
+        error: "An execution workspace already exists for this cwd with a different identity; inspect it before any further registration attempt",
+        conflict: {
+          id: workspace.id,
+          status: workspace.status,
+          mode: workspace.mode,
+          strategyType: workspace.strategyType,
+          baseRef: workspace.baseRef,
+          branchName: workspace.branchName,
+          sourceIssueId: workspace.sourceIssueId,
+          closedAt: workspace.closedAt,
+        },
+      });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: accessible.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "execution_workspace.registered_prepared",
+      entityType: "execution_workspace",
+      entityId: workspace.id,
+      details: {
+        projectId: accessible.id,
+        cwd: payload.cwd,
+        baseRef: payload.baseRef,
+        idempotent: !registration.created,
+      },
+    });
+    res.status(registration.created ? 201 : 200).json(workspace);
   });
 
   router.patch("/execution-workspaces/:id", validate(updateExecutionWorkspaceSchema), async (req, res) => {

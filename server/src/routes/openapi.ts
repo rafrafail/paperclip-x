@@ -126,6 +126,7 @@ import {
   dismissAnnouncementSchema,
   // Execution workspaces
   reconcileExecutionWorkspaceBranchSchema,
+  registerPreparedExecutionWorkspaceSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
@@ -8079,6 +8080,32 @@ registry.registerPath({
   summary: "List workspace operations",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/projects/{id}/execution-workspaces",
+  tags: ["execution-workspaces"],
+  summary: "Register an operator-prepared detached execution workspace",
+  description:
+    "Registers an already-realized, detached git worktree at an exact commit as the project's execution workspace record. Registration only: never realizes git state, never accepts branches, source issues, host-executed commands or metadata. Fails closed unless the cwd exists as a directory strictly inside the project's own `_work/` tree and the repoUrl matches the project primary workspace exactly.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(registerPreparedExecutionWorkspaceSchema),
+  },
+  responses: {
+    200: r.ok(),
+    201: {
+      description: "Created",
+      content: { "application/json": { schema: z.record(z.string(), z.unknown()) } },
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({

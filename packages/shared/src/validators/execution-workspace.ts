@@ -175,6 +175,42 @@ export const reconcileExecutionWorkspaceBranchSchema = z.discriminatedUnion("mod
   }).strict(),
 ]);
 
+/**
+ * Register an already-prepared, detached execution workspace on disk as an
+ * execution workspace record. This exists for prepared independent review
+ * checkouts (and equivalent operator-prepared pristine worktrees): the record
+ * must describe the exact on-disk identity — an absolute normalized path, the
+ * exact git object id it is detached at, and the project's repository URL —
+ * and it never carries a branch, a source issue, or host-executed commands.
+ */
+const preparedExecutionWorkspaceCwdSchema = z.string().min(1).max(4096).refine((value) => {
+  if (value !== value.trim() || value.includes("\x00")) return false;
+  if (!value.startsWith("/")) return false;
+  const segments = value.split("/").slice(1);
+  return segments.length > 0
+    && segments.every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}, "cwd must be a normalized absolute path without '.', '..' or empty segments");
+
+const preparedExecutionWorkspaceBaseRefSchema = z.string().regex(
+  /^[0-9a-f]{40}$/,
+  "baseRef must be an exact 40-character lowercase git object id",
+);
+
+const preparedExecutionWorkspaceRepoUrlSchema = z.string().min(1).max(2048).refine((value) => {
+  if (value !== value.trim()) return false;
+  return ![...value].some((ch) => ch.charCodeAt(0) < 32 || ch === " ");
+}, "repoUrl must be a trimmed repository URL without whitespace or control characters");
+
+export const registerPreparedExecutionWorkspaceSchema = z.object({
+  cwd: preparedExecutionWorkspaceCwdSchema,
+  repoUrl: preparedExecutionWorkspaceRepoUrlSchema,
+  baseRef: preparedExecutionWorkspaceBaseRefSchema,
+  status: z.enum(["idle", "in_review"]).optional(),
+  name: z.string().trim().min(1).max(200).optional(),
+}).strict();
+
+export type RegisterPreparedExecutionWorkspace = z.infer<typeof registerPreparedExecutionWorkspaceSchema>;
+
 export type UpdateExecutionWorkspace = z.infer<typeof updateExecutionWorkspaceSchema>;
 export type ReconcileExecutionWorkspaceBranch = z.infer<typeof reconcileExecutionWorkspaceBranchSchema>;
 export type WorkspaceOverviewQuery = z.infer<typeof workspaceOverviewQuerySchema>;

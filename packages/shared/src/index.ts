@@ -2029,6 +2029,7 @@ export {
   companyArtifactsQuerySchema,
   companyArtifactsResponseSchema,
   reconcileExecutionWorkspaceBranchSchema,
+  registerPreparedExecutionWorkspaceSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   executionWorkspaceDeliveryStateSchema,

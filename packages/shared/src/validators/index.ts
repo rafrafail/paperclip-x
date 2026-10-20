@@ -581,6 +581,7 @@ export {
 export {
   executionWorkspaceConfigSchema,
   reconcileExecutionWorkspaceBranchSchema,
+  registerPreparedExecutionWorkspaceSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   executionWorkspaceDeliveryStateSchema,
