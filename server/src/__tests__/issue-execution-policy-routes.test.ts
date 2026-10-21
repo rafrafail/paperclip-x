@@ -278,6 +278,9 @@ describe("issue execution policy routes", () => {
       title: "Concurrent policy update",
       executionPolicy: null,
       executionState: null,
+      // Agents may only complete the execution run they own, with a passed
+      // handoff; the locked review policy is what must refuse this verdict.
+      executionRunId: "55555555-5555-4555-8555-555555555555",
     };
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.getByIdForUpdate.mockResolvedValue({
@@ -292,7 +295,7 @@ describe("issue execution policy routes", () => {
       runId: "55555555-5555-4555-8555-555555555555",
     }))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-      .send({ status: "done" });
+      .send({ status: "done", terminalHandoff: { outcome: "passed", summary: "Agent finished the run." } });
 
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({

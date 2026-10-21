@@ -196,6 +196,15 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     };
   }
 
+  // Agents may only complete the execution run they own, with a passed
+  // handoff. Agent verdict fixtures own the issue's run so the review guard
+  // under test is the one that decides the request.
+  const passedTerminalHandoff = { outcome: "passed", summary: "Agent finished the run." };
+
+  async function ownExecutionRun(issueId: string, runId: string) {
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+  }
+
   async function seedRun(companyId: string, agentId: string, issueId: string) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -244,9 +253,10 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(crossCompany.body).toEqual(missing.body);
 
     const selfRunId = await seedRun(primary.companyId, primary.assigneeAgentId, issueId);
+    await ownExecutionRun(issueId, selfRunId);
     const selfApproval = await request(app(agentActor(primary.companyId, primary.assigneeAgentId, selfRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
+      .send({ status: "done", terminalHandoff: passedTerminalHandoff });
     expect(selfApproval.status, JSON.stringify(selfApproval.body)).toBe(200);
     expect(selfApproval.body).toMatchObject({ id: issueId, status: "done" });
   });
@@ -286,10 +296,11 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       },
     }).where(eq(issues.id, issueId));
     const stageRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    await ownExecutionRun(issueId, stageRunId);
 
     const res = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, stageRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done", comment: "Stage signoff." });
+      .send({ status: "done", comment: "Stage signoff.", terminalHandoff: passedTerminalHandoff });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body).toMatchObject({ id: issueId, status: "done" });
@@ -314,9 +325,11 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       details: { status: "in_review", _previous: { status: "in_progress" } },
     });
 
-    const requesterVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId)))
+    const requesterRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    await ownExecutionRun(issueId, requesterRunId);
+    const requesterVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, requesterRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
+      .send({ status: "done", terminalHandoff: passedTerminalHandoff });
     expect(requesterVerdict.status).toBe(403);
     expect(requesterVerdict.body).toMatchObject({
       error: expect.stringContaining("someone other than"),
@@ -329,9 +342,10 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     });
 
     const peerRunId = await seedRun(seeded.companyId, seeded.peerAgentId, issueId);
+    await ownExecutionRun(issueId, peerRunId);
     const peerVerdict = await request(app(agentActor(seeded.companyId, seeded.peerAgentId, peerRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
+      .send({ status: "done", terminalHandoff: passedTerminalHandoff });
     expect(peerVerdict.status, JSON.stringify(peerVerdict.body)).toBe(200);
     expect(peerVerdict.body).toMatchObject({ id: issueId, status: "done" });
   });
@@ -375,10 +389,11 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       reviewPolicy: "human_only",
     });
     const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    await ownExecutionRun(issueId, runId);
 
     const verdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done", reviewPolicy: "anyone" });
+      .send({ status: "done", reviewPolicy: "anyone", terminalHandoff: passedTerminalHandoff });
 
     expect(verdict.status).toBe(403);
     expect(verdict.body).toMatchObject({
@@ -415,10 +430,11 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       details: { status: "in_review", _previous: { status: "in_progress" } },
     });
     const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    await ownExecutionRun(issueId, runId);
 
     const verdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done", reviewPolicy: "anyone" });
+      .send({ status: "done", reviewPolicy: "anyone", terminalHandoff: passedTerminalHandoff });
 
     expect(verdict.status).toBe(403);
     expect(verdict.body).toMatchObject({

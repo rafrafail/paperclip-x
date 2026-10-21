@@ -213,6 +213,11 @@ describe("issue telemetry routes", () => {
       adapterType: "codex_local",
       adapterConfig: { model: "claude-sonnet-4-6" },
     });
+    // Agents may only complete the execution run they own, with a passed handoff.
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("todo"),
+      executionRunId: "22222222-2222-4222-8222-222222222222",
+    });
 
     const app = await createApp({
       type: "agent",
@@ -222,7 +227,7 @@ describe("issue telemetry routes", () => {
     });
     const res = await request(app)
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ status: "done" });
+      .send({ status: "done", terminalHandoff: { outcome: "passed", summary: "Agent finished the run." } });
 
     expect(res.status).toBe(200);
     await vi.waitFor(() => {
