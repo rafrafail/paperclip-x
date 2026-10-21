@@ -152,6 +152,44 @@ async function runPnpm(cwd: string, args: string[]) {
   await execFileAsync("pnpm", args, { cwd });
 }
 
+// provision-worktree.sh finally falls back to any `paperclipai` on PATH, and
+// a CLI that runs and fails correctly fails provisioning. Fixtures that model
+// a host without a usable CLI must therefore not inherit a developer's
+// globally installed one. Every other host tool (node, pnpm, git, ...) stays
+// reachable: a PATH directory holding `paperclipai` is replaced by a scratch
+// directory linking everything in it except that CLI.
+async function hostPathWithoutPaperclipCli(scratchRoot: string) {
+  const entries: string[] = [];
+  for (const [index, dir] of (process.env.PATH ?? "").split(path.delimiter).entries()) {
+    if (!dir) continue;
+    const cli = await fs.lstat(path.join(dir, "paperclipai")).then(() => true, () => false);
+    if (!cli) {
+      entries.push(dir);
+      continue;
+    }
+    const shadow = path.join(scratchRoot, `host-path-${index}`);
+    await fs.mkdir(shadow, { recursive: true });
+    for (const name of await fs.readdir(dir)) {
+      if (name !== "paperclipai") await fs.symlink(path.join(dir, name), path.join(shadow, name));
+    }
+    entries.push(shadow);
+  }
+  return entries.join(path.delimiter);
+}
+
+async function withHostPathWithoutPaperclipCli<T>(action: () => Promise<T>) {
+  const scratchRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-path-"));
+  const previousPath = process.env.PATH;
+  try {
+    process.env.PATH = await hostPathWithoutPaperclipCli(scratchRoot);
+    return await action();
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await fs.rm(scratchRoot, { recursive: true, force: true });
+  }
+}
+
 async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source-instance") {
   const configDir = path.join(baseCwd, ".paperclip");
   await fs.mkdir(configDir, { recursive: true });
@@ -1989,7 +2027,7 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "."]);
     await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
+    const workspace = await withHostPathWithoutPaperclipCli(() => realizeExecutionWorkspace({
       base: {
         baseCwd: repoRoot,
         source: "project_primary",
@@ -2015,7 +2053,7 @@ describe("realizeExecutionWorkspace", () => {
         name: "Codex Coder",
         companyId: "company-1",
       },
-    });
+    }));
 
     expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
     expect((await fs.lstat(path.join(workspace.cwd, "server", "node_modules"))).isSymbolicLink()).toBe(false);
@@ -2070,7 +2108,7 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "package.json", "pnpm-lock.yaml", "scripts/provision-worktree.sh"]);
     await runGit(repoRoot, ["commit", "-m", "Add minimal provision fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
+    const workspace = await withHostPathWithoutPaperclipCli(() => realizeExecutionWorkspace({
       base: {
         baseCwd: repoRoot,
         source: "project_primary",
@@ -2096,7 +2134,7 @@ describe("realizeExecutionWorkspace", () => {
         name: "Codex Coder",
         companyId: "company-1",
       },
-    });
+    }));
 
     await expect(fs.readFile(path.join(workspace.cwd, ".paperclip", "config.json"), "utf8")).resolves.toContain(
       "\"database\"",
@@ -2161,12 +2199,13 @@ describe("realizeExecutionWorkspace", () => {
         "utf8",
       );
       await fs.chmod(fakePnpmPath, 0o755);
+      const hostPath = await hostPathWithoutPaperclipCli(tempRoot);
 
       const runScript = () => execFileAsync(scriptPath, [], {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PATH: `${fakeBin}:${hostPath}`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
@@ -2401,12 +2440,13 @@ describe("realizeExecutionWorkspace", () => {
         "utf8",
       );
       await fs.chmod(fakePnpmPath, 0o755);
+      const hostPath = await hostPathWithoutPaperclipCli(tempRoot);
 
       const result = await execFileAsync(scriptPath, [], {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PATH: `${fakeBin}:${hostPath}`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
@@ -2487,7 +2527,7 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "."]);
     await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
+    const workspace = await withHostPathWithoutPaperclipCli(() => realizeExecutionWorkspace({
       base: {
         baseCwd: repoRoot,
         source: "project_primary",
@@ -2513,7 +2553,7 @@ describe("realizeExecutionWorkspace", () => {
         name: "Codex Coder",
         companyId: "company-1",
       },
-    });
+    }));
 
     expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
     expect((await fs.lstat(path.join(workspace.cwd, "server", "node_modules"))).isSymbolicLink()).toBe(false);
