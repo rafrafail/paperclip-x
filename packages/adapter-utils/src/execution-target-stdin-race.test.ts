@@ -1017,17 +1017,36 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
             `const mode = process.env.PAPERCLIP_TEST_PROBE_SWAP_MODE;`,
             `const seq = process.env.PAPERCLIP_TEST_PROBE_SWAP_SEQ;`,
             `const symlinkTarget = process.env.PAPERCLIP_TEST_PROBE_SWAP_SYMLINK_TARGET;`,
+            `const reportPath = process.env.PAPERCLIP_TEST_PROBE_SWAP_REPORT;`,
             `if (mode && seq) {`,
             `  const expectedName = ".paperclip-birthtime-probe-" + process.pid + "-" + seq;`,
             `  let swapped = false;`,
+            `  let probeHandle = null;`,
+            `  const originalOpen = fs.promises.open.bind(fs.promises);`,
+            `  fs.promises.open = async (targetPath, flags, openMode) => {`,
+            `    const handle = await originalOpen(targetPath, flags, openMode);`,
+            `    if (path.basename(String(targetPath)) === expectedName) probeHandle = handle;`,
+            `    return handle;`,
+            `  };`,
             `  const originalLstat = fs.promises.lstat.bind(fs.promises);`,
             `  fs.promises.lstat = async (candidatePath, opts) => {`,
             `    if (!swapped && path.basename(String(candidatePath)) === expectedName) {`,
             `      swapped = true;`,
+            `      let originalIno = null;`,
+            `      try { originalIno = fs.lstatSync(candidatePath).ino; } catch {}`,
             `      try { fs.unlinkSync(candidatePath); } catch {}`,
             `      if (mode === "file") fs.writeFileSync(candidatePath, "peer-owned-content");`,
             `      else if (mode === "dir") fs.mkdirSync(candidatePath);`,
             `      else if (mode === "symlink") fs.symlinkSync(symlinkTarget, candidatePath);`,
+            `      if (reportPath) {`,
+            `        // Records, at the wrapper's final ownership check, whether the`,
+            `        // wrapper still holds its own probe inode open.`,
+            `        let heldIno = null;`,
+            `        try { heldIno = probeHandle && probeHandle.fd >= 0 ? fs.fstatSync(probeHandle.fd).ino : null; } catch {}`,
+            `        let replacementIno = null;`,
+            `        try { replacementIno = fs.lstatSync(candidatePath).ino; } catch {}`,
+            `        fs.writeFileSync(reportPath, JSON.stringify({ originalIno, heldIno, replacementIno }));`,
+            `      }`,
             `    }`,
             `    return originalLstat(candidatePath, opts);`,
             `  };`,
@@ -1112,7 +1131,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     // Makes the wrapper's own process observe a same-sandbox peer replacing
     // its birth-time probe file, through the preload above (PAP-5355). seq 1
     // is sessionDir's probe (the first one captureSessionIdentity() runs).
-    probeSwap?: { seq: 1 | 2; mode: "file" | "dir" | "symlink"; symlinkTarget?: string };
+    probeSwap?: { seq: 1 | 2; mode: "file" | "dir" | "symlink"; symlinkTarget?: string; reportPath?: string };
     // Makes the wrapper's own process observe an fstat() failure on the open
     // descriptor for its own birth-time probe file, through the preload above
     // (PAP-5374). seq 1 is sessionDir's probe (the first one
@@ -1150,6 +1169,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
       env.PAPERCLIP_TEST_PROBE_SWAP_SEQ = String(options.probeSwap.seq);
       env.PAPERCLIP_TEST_PROBE_SWAP_MODE = options.probeSwap.mode;
       if (options.probeSwap.symlinkTarget) env.PAPERCLIP_TEST_PROBE_SWAP_SYMLINK_TARGET = options.probeSwap.symlinkTarget;
+      if (options.probeSwap.reportPath) env.PAPERCLIP_TEST_PROBE_SWAP_REPORT = options.probeSwap.reportPath;
       execArgv.push("--require", await getProbeSwapPreloadPath());
     }
     if (options?.fstatFailure) {
@@ -2347,6 +2367,54 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     expect(await readlink(probePath)).toBe(linkTarget);
     expect(await readFile(linkTarget, "utf8")).toBe(knownContent);
   }, 15_000);
+
+  it.each(["file", "symlink"] as const)(
+    "T26 still holds its own probe inode open when a peer replaces the %s at its final ownership check",
+    async (mode) => {
+      // T22 and T24 only fail when the filesystem happens to hand the freed
+      // probe inode, with the same ctime, to the peer's replacement. This
+      // checks the invariant itself on every run: the wrapper's own inode is
+      // still allocated at its final identity read, so the peer's entry can
+      // never carry its (dev, ino).
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-held-open-"));
+      cleanupDirs.push(rootDir);
+      const pidFile = path.join(rootDir, "t26-child.pid");
+      const childPath = path.join(rootDir, "t26-child.mjs");
+      const reportPath = path.join(rootDir, "swap-report.json");
+      const linkTarget = path.join(rootDir, "t26-link-target.txt");
+      await writeFile(childPath, trackedChildSource(pidFile), "utf8");
+      await writeFile(linkTarget, "t26-known-content", "utf8");
+
+      const wrapper = await startWrapperProcess({
+        outputToStdout: false,
+        command: process.execPath,
+        args: [childPath],
+        probeSwap: { seq: 1, mode, symlinkTarget: linkTarget, reportPath },
+      });
+      await waitForTrackedChildPid(pidFile);
+
+      await waitFor(async () => (await readFile(reportPath, "utf8").catch(() => null)) !== null, 4_000);
+      const report = JSON.parse(await readFile(reportPath, "utf8")) as {
+        originalIno: number | null;
+        heldIno: number | null;
+        replacementIno: number | null;
+      };
+      expect(report.originalIno).not.toBeNull();
+      expect(report.heldIno).toBe(report.originalIno);
+      expect(report.replacementIno).not.toBeNull();
+      expect(report.replacementIno).not.toBe(report.originalIno);
+
+      const probePath = path.join(wrapper.sessionDir, `.paperclip-birthtime-probe-${wrapper.pid}-1`);
+      await delay(200);
+      if (mode === "file") {
+        expect(await readFile(probePath, "utf8")).toBe("peer-owned-content");
+      } else {
+        expect(await readlink(probePath)).toBe(linkTarget);
+        expect(await readFile(linkTarget, "utf8")).toBe("t26-known-content");
+      }
+    },
+    15_000,
+  );
 
   it("T25 fails closed at capture when its own probe file's identity cannot be read, so no orphan wrapper or child ever starts polling", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-fstat-failure-"));
