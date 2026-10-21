@@ -427,9 +427,14 @@ describe("Photon durable event recovery", () => {
         (error, port) => (error ? reject(error) : resolve(port)),
       ),
     );
+    // The synthetic server is in-process on loopback. grpc-js otherwise routes
+    // through any ambient lowercase https_proxy/http_proxy (only no_grpc_proxy
+    // or lowercase no_proxy exempt hosts), so the channel never connects.
     const transport = new PhotonRecoveryTransport(
       f.authentication,
-      new Client(`127.0.0.1:${port}`, credentials.createInsecure()),
+      new Client(`127.0.0.1:${port}`, credentials.createInsecure(), {
+        "grpc.enable_http_proxy": 0,
+      }),
     );
     try {
       const result = [];
