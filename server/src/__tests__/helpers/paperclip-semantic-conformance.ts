@@ -443,9 +443,13 @@ class PaperclipRouteSemanticPort {
         ]);
       }
       case "finish_task": {
+        // The agent completion contract: production accepts `done` from the
+        // run that owns execution only with a typed, passed terminalHandoff
+        // bound to that run (issues route; agent instructions in adapter-utils).
         const response = await this.patch(`/api/issues/${taskId}`, {
           status: "done",
           comment: command.summary,
+          terminalHandoff: { outcome: "passed", summary: command.summary },
         });
         if (!isSuccess(response.status)) return this.routeDenial(command, response.status, response.body);
         return this.success(command, [`task:${taskId}`, `comment:${taskId}`]);
