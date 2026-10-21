@@ -180,6 +180,10 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import {
+  FAILED_RUN_RETRY_SUCCESSOR_REPLAY_VERSION,
+  findRetrySuccessor,
+} from "./failed-run-retry-successor.js";
+import {
   getStartupTraceContext,
   getStartupTracer,
 } from "../instrumentation.js";
@@ -817,6 +821,7 @@ function isTransientWorkspaceGitScanCode(code: string | null | undefined): boole
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 export {
+  FAILED_RUN_RETRY_SUCCESSOR_REPLAY_VERSION,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
 };
@@ -15580,7 +15585,8 @@ export function heartbeatService(
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
-            | "issue_execution_lock_changed";
+            | "issue_execution_lock_changed"
+            | "retry_successor_exists";
           issueId: string | null;
           details: Record<string, unknown>;
         };
@@ -15600,16 +15606,7 @@ export function heartbeatService(
           await tx.execute(
             sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
           );
-          const [existing] = await tx
-            .select()
-            .from(heartbeatRuns)
-            .where(
-              and(
-                eq(heartbeatRuns.companyId, run.companyId),
-                eq(heartbeatRuns.retryOfRunId, run.id),
-              ),
-            )
-            .limit(1);
+          const existing = await findRetrySuccessor(tx as unknown as Db, run.companyId, run.id);
           if (existing)
             return {
               outcome: "scheduled",
@@ -15682,6 +15679,18 @@ export function heartbeatService(
               reusedExisting: true,
             };
           }
+          // Never a second successor beside another lane's (e.g. an exact
+          // Board failed-run retry); the issue/run lock above serializes it.
+          const foreignSuccessor = await findRetrySuccessor(tx as unknown as Db, run.companyId, run.id);
+          if (foreignSuccessor) {
+            return {
+              outcome: "not_scheduled",
+              reason: "Retry suppressed because this run already has a retry successor",
+              errorCode: "retry_successor_exists",
+              issueId,
+              details: { issueId, successorRunId: foreignSuccessor.id },
+            };
+          }
         }
 
         if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
@@ -15747,6 +15756,18 @@ export function heartbeatService(
               outcome: "scheduled",
               run: existingContinuation,
               reusedExisting: true,
+            };
+          }
+          // Never a second successor beside another lane's (e.g. an exact
+          // Board failed-run retry); the issue/run lock above serializes it.
+          const foreignSuccessor = await findRetrySuccessor(tx as unknown as Db, run.companyId, run.id);
+          if (foreignSuccessor) {
+            return {
+              outcome: "not_scheduled",
+              reason: "Retry suppressed because this run already has a retry successor",
+              errorCode: "retry_successor_exists",
+              issueId,
+              details: { issueId, successorRunId: foreignSuccessor.id },
             };
           }
 
@@ -27308,14 +27329,21 @@ export function heartbeatService(
           }
 
           if (opts.failedRunId) {
-            // The issue lock makes double-clicks and network retries adopt the
-            // same successor, including after it has already finished.
-            const [previousRetry] = await tx.select().from(heartbeatRuns).where(and(
-              eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId),
-              eq(heartbeatRuns.retryOfRunId, opts.failedRunId),
-              sql`${heartbeatRuns.contextSnapshot}->>'wakeReason' = 'retry_failed_run'`,
-            )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-            if (previousRetry) return { kind: "replayed" as const, run: previousRetry };
+            // Issue then run row lock, the same order as the automatic
+            // schedulers. Double-clicks, network retries and an earlier native
+            // successor (scheduled, running or already finished) all resolve
+            // to the run's one successor: no new run, wake or dispatch.
+            await tx.execute(
+              sql`select id from heartbeat_runs where company_id = ${issue.companyId} and id = ${opts.failedRunId} for update`,
+            );
+            const successor = await findRetrySuccessor(tx as unknown as Db, issue.companyId, opts.failedRunId);
+            if (successor && successor.agentId !== agentId) {
+              throw conflict("The selected failed run already has a retry owned by another agent.", {
+                code: "failed_run_retry_successor_conflict",
+                successorRunId: successor.id,
+              });
+            }
+            if (successor) return { kind: "replayed" as const, run: successor };
           }
 
           let reconciledSourceRunId: string | null = null;

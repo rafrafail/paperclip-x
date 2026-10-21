@@ -511,6 +511,37 @@ describe("GET /health", () => {
     });
   });
 
+  it("advertises the versioned failed-run retry successor replay contract on detailed health only", async () => {
+    // Real router; the Db is a stub answering only the liveness probe.
+    const res = await request(createApp(createHealthyDb())).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.features).toEqual({
+      companyDeletionEnabled: true,
+      failedRunRetrySuccessorReplay: 1,
+    });
+    expect(Number.isInteger(res.body.features.failedRunRetrySuccessorReplay)).toBe(true);
+
+    const anonymous = express();
+    anonymous.use((req, _res, next) => {
+      (req as any).actor = { type: "none", source: "none" };
+      next();
+    });
+    anonymous.use("/health", healthRoutes({
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn().mockResolvedValue([{ count: 1 }]) })) })),
+    } as unknown as Db, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "public",
+      authReady: true,
+      companyDeletionEnabled: false,
+      serverInfo: testServerInfo,
+    }));
+    const redacted = await request(anonymous).get("/health");
+    expect(redacted.status).toBe(200);
+    expect(redacted.body.features).toBeUndefined();
+  });
+
   it("reports bootstrap_pending in authenticated mode when no instance admin exists", async () => {
     const { healthRoutes } = await import("../routes/health.js");
     const db = {

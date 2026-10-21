@@ -71,6 +71,42 @@ boundary.
 This is intentional continuation: the result explicitly says more work is
 needed and leaves a persisted execution path.
 
+## One retry successor per run
+
+A run has at most one `retryOfRunId` successor, whichever lane creates it
+first:
+
+- the exact Board failed-run retry, `POST /api/agents/:id/wakeup` with
+  `failedRunId` and `reason: "retry_failed_run"`;
+- an automatic bounded retry (`scheduleBoundedRetryForRun`).
+
+Exact admission locks the issue row and then the failed run row. That is the
+same order the automatic schedulers use. Under those locks it reads the
+run's successor (`findRetrySuccessor`). If the successor belongs to the same
+agent, admission returns it, whether it is a native `scheduled_retry`,
+`queued`, `running` or terminal run. No run or wake is created, and dispatch is
+only nudged for an existing queued run. If another agent owns the successor,
+admission returns `409 failed_run_retry_successor_conflict`. Existing checks
+still apply: the run must be `failed` or `timed_out`, and agent, issue and
+access are re-checked.
+
+The generic automatic lane adopts an existing successor. The max-turn and
+interaction-continuation lanes keep their own same-reason dedupe. Beside a
+successor from another lane they return `not_scheduled` with
+`retry_successor_exists`. Native retry policy, delays and budgets are
+unchanged.
+
+Detailed `GET /api/health` (board/agent actors, or any caller in
+`local_trusted` mode) advertises this contract as
+`features.failedRunRetrySuccessorReplay: 1`. Anonymous health in
+authenticated mode is redacted and omits it.
+
+Activation is server first. Deploy a server that reports the field, then
+enable any external retry owner. A client that sends exact failed-run retries
+on its own behalf must require this exact version before it spends its own
+retry allowance or sends anything. Missing, malformed, other-version or
+unreachable health means no retry.
+
 ## Stranded-issue reconciliation
 
 `reconcileStrandedAssignedIssues()` scans agent-owned issues in `todo`,

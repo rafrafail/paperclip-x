@@ -38,6 +38,7 @@ export type HealthStatus = {
   bootstrapInviteActive?: boolean;
   features?: {
     companyDeletionEnabled?: boolean;
+    failedRunRetrySuccessorReplay?: number;
   };
   serverInfo?: ServerInfoSnapshot;
   devServer?: DevServerHealthStatus;
