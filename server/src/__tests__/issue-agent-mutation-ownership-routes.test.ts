@@ -390,13 +390,20 @@ function createRunContextDb(
   return dbStub;
 }
 
+const peerRunId = "66666666-6666-4666-8666-666666666666";
+
+// Agents may only complete an execution run they own, with a passed handoff.
+// Completion fixtures give the peer that run so the ownership guard under test
+// is the one that decides the request.
+const passedTerminalHandoff = { outcome: "passed", summary: "Peer finished the run." };
+
 function peerActor(overrides: Record<string, unknown> = {}) {
   return {
     type: "agent",
     agentId: peerAgentId,
     companyId,
     source: "agent_key",
-    runId: "66666666-6666-4666-8666-666666666666",
+    runId: peerRunId,
     ...overrides,
   };
 }
@@ -1032,7 +1039,9 @@ describe("agent issue mutation checkout ownership", () => {
   });
 
   it("allows visible issue field updates for peer agents", async () => {
-    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, executionRunId: peerRunId }),
+    );
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:comment" || input.action === "issue:mutate",
       action: input.action,
@@ -1052,7 +1061,7 @@ describe("agent issue mutation checkout ownership", () => {
 
     const res = await request(await createApp(peerActor()))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "done" });
+      .send({ status: "done", terminalHandoff: passedTerminalHandoff });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalledWith(
@@ -1675,11 +1684,14 @@ describe("agent issue mutation checkout ownership", () => {
   ])(
     "rejects peer agent direct status transitions from %s to %s",
     async (status, nextStatus, expectedStatus, expectedError) => {
-      mockIssueService.getById.mockResolvedValue(makeIssue({ status, assigneeAgentId: ownerAgentId }));
+      const completing = nextStatus === "done";
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status, assigneeAgentId: ownerAgentId, ...(completing ? { executionRunId: peerRunId } : {}) }),
+      );
 
       const res = await request(await createApp(peerActor()))
         .patch(`/api/issues/${issueId}`)
-        .send({ status: nextStatus });
+        .send({ status: nextStatus, ...(completing ? { terminalHandoff: passedTerminalHandoff } : {}) });
 
       expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
       expect(res.body.error).toBe(expectedError);
@@ -1844,8 +1856,9 @@ describe("agent issue mutation checkout ownership", () => {
   it.each(["done", "cancelled"])(
     "rejects recovery-owner PATCH of an agent-owned source to %s",
     async (status) => {
+      const completing = status === "done";
       mockIssueService.getById.mockResolvedValue(
-        makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }),
+        makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, ...(completing ? { executionRunId: peerRunId } : {}) }),
       );
       mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
         id: recoveryActionId,
@@ -1854,7 +1867,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       const res = await request(await createApp(peerActor()))
         .patch(`/api/issues/${issueId}`)
-        .send({ status });
+        .send({ status, ...(completing ? { terminalHandoff: passedTerminalHandoff } : {}) });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.details?.code).toBe("recovery_source_authority_required");

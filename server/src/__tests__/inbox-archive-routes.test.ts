@@ -291,10 +291,12 @@ describeEmbeddedPostgres("inbox archive routes", () => {
 
   it("does not archive a responsible user's inbox when an agent moves an issue to done", async () => {
     const seeded = await seed();
+    // Agents may only complete the execution run they own, with a passed handoff.
+    await db.update(issues).set({ executionRunId: seeded.runId }).where(eq(issues.id, seeded.issueId));
 
     await request(appFor(agentActor(seeded)))
       .patch(`/api/issues/${seeded.issueId}`)
-      .send({ status: "done" })
+      .send({ status: "done", terminalHandoff: { outcome: "passed", summary: "Agent finished the run." } })
       .expect(200);
 
     expect(await db.select().from(issueInboxArchives)).toHaveLength(0);

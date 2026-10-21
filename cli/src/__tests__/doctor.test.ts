@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { doctor } from "../commands/doctor.js";
 import { writeConfig } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
@@ -87,15 +87,31 @@ function createTempConfig(serverPort: number): string {
 }
 
 describe("doctor", () => {
+  let homeRoot: string;
+
   beforeEach(() => {
-    process.env = { ...ORIGINAL_ENV };
+    // Managed-install and service checks resolve the user's home, Paperclip
+    // home, and instance. Keep them on a private root so a real install store
+    // or service on the host cannot change this test's result.
+    homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-doctor-home-"));
+    const homeDir = path.join(homeRoot, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    process.env = {
+      ...ORIGINAL_ENV,
+      HOME: homeDir,
+      PAPERCLIP_HOME: path.join(homeDir, ".paperclip"),
+      PAPERCLIP_INSTANCE_ID: `doctor-test-${process.pid}`,
+    };
+    vi.spyOn(os, "homedir").mockReturnValue(homeDir);
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     process.env = { ...ORIGINAL_ENV };
+    fs.rmSync(homeRoot, { recursive: true, force: true });
   });
 
   it("re-runs repairable checks so repaired failures do not remain blocking", async () => {

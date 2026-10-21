@@ -29,6 +29,18 @@ import { systemdServiceName } from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
+// Replacing process.env does not change os.homedir(), so uninstall defaults
+// would otherwise inspect the host user's real systemd units and service.
+function isolatedUninstallDependencies() {
+  return {
+    detectServiceManager: vi.fn(async () => ({
+      supported: true as const,
+      manager: { status: vi.fn(async () => ({ installed: false, active: false })) } as never,
+    })),
+    userHomeDir: process.env.HOME!,
+  };
+}
+
 describe("managed install commands", () => {
   let root: string;
 
@@ -262,6 +274,7 @@ describe("managed install commands", () => {
           uninstall: uninstallService,
         } as never,
       })),
+      userHomeDir: process.env.HOME!,
     });
 
     expect(uninstallService).toHaveBeenCalledOnce();
@@ -335,7 +348,7 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand(isolatedUninstallDependencies())).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -357,7 +370,7 @@ describe("managed install commands", () => {
 
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand(isolatedUninstallDependencies())).rejects.toThrow("already running");
       },
       paths,
     );
