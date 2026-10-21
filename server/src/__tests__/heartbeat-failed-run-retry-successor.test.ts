@@ -24,9 +24,18 @@ vi.mock("../telemetry.js", () => ({
   getTelemetryClient: () => mockTelemetryClient,
 }));
 
+vi.mock("@paperclipai/shared/telemetry", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/shared/telemetry")>(
+    "@paperclipai/shared/telemetry",
+  );
+  return { ...actual, trackAgentTaskRun: vi.fn() };
+});
+
 import {
   FAILED_RUN_RETRY_SUCCESSOR_REPLAY_VERSION,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+  MAX_TURN_CONTINUATION_RETRY_REASON,
+  MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -315,5 +324,159 @@ describeEmbeddedPostgres("exact failed-run retry shares the single retry success
     await expect(boardRetry(fixture, fixture.failedRunId)).rejects.toMatchObject({ status: 409 });
 
     expect(await counts()).toEqual(before);
+  });
+
+  // B1-residual: an exact retry admitted while UNRELATED execution owns the
+  // issue must be refused outright, never coalesced into that run or deferred
+  // and later promoted without its retryOfRunId identity.
+  async function unrelatedExecution(
+    fixture: Awaited<ReturnType<typeof seed>>,
+    input: { status: "queued" | "running"; agentId?: string; holdsLock?: boolean },
+  ) {
+    const id = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id,
+      companyId: fixture.companyId,
+      agentId: input.agentId ?? fixture.agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: input.status,
+      ...(input.status === "running" ? { startedAt: new Date() } : {}),
+      contextSnapshot: { issueId: fixture.issueId, taskId: fixture.issueId, wakeReason: "issue_commented" },
+    });
+    if (input.holdsLock) {
+      await db.update(issues).set({
+        executionRunId: id,
+        executionAgentNameKey: input.agentId === fixture.otherAgentId ? "other" : "reviewer",
+        executionLockedAt: new Date(),
+      }).where(eq(issues.id, fixture.issueId));
+    }
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id));
+    return row!;
+  }
+
+  async function retryWakeRows() {
+    return db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.reason, "retry_failed_run"));
+  }
+
+  async function expectRejectedWithoutSideEffects(
+    fixture: Awaited<ReturnType<typeof seed>>,
+    unrelated: typeof heartbeatRuns.$inferSelect,
+  ) {
+    const before = await counts();
+    const [issueBefore] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+
+    await expect(boardRetry(fixture, fixture.failedRunId)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "failed_run_retry_issue_busy", activeRunId: unrelated.id },
+    });
+
+    expect(await counts()).toEqual(before);
+    expect(await retryWakeRows()).toEqual([]);
+    expect(await successors(fixture.failedRunId)).toEqual([]);
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, unrelated.id));
+    expect({ status: after!.status, contextSnapshot: after!.contextSnapshot, agentId: after!.agentId })
+      .toEqual({ status: unrelated.status, contextSnapshot: unrelated.contextSnapshot, agentId: unrelated.agentId });
+    const [issueAfter] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect({ executionRunId: issueAfter!.executionRunId, status: issueAfter!.status })
+      .toEqual({ executionRunId: issueBefore!.executionRunId, status: issueBefore!.status });
+  }
+
+  it.each([
+    ["queued without the lock (lazy locking)", { status: "queued" as const }],
+    ["running and holding the lock", { status: "running" as const, holdsLock: true }],
+  ])("rejects an exact retry behind unrelated same-agent issue execution %s", async (_name, input) => {
+    const fixture = await seed();
+    const unrelated = await unrelatedExecution(fixture, input);
+    await expectRejectedWithoutSideEffects(fixture, unrelated);
+  });
+
+  it("rejects behind another agent's live issue execution and never promotes it later", async () => {
+    const fixture = await seed();
+    const unrelated = await unrelatedExecution(fixture, {
+      status: "running", agentId: fixture.otherAgentId, holdsLock: true,
+    });
+    await expectRejectedWithoutSideEffects(fixture, unrelated);
+
+    // Real finalize → release → deferred-wake promotion path.
+    await heartbeat.cancelRun(unrelated.id);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    expect(await retryWakeRows()).toEqual([]);
+    const reviewerRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, fixture.agentId));
+    expect(reviewerRuns.filter((row) => row.contextSnapshot?.issueId === fixture.issueId).map((row) => row.id))
+      .toEqual([fixture.failedRunId]);
+  });
+
+  it("late admission behind an ordinary wake that already queued unrelated work is refused", async () => {
+    const fixture = await seed();
+    const ordinary = await heartbeat.wakeup(fixture.agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "issue_assigned",
+      payload: { issueId: fixture.issueId, taskId: fixture.issueId },
+      contextSnapshot: { issueId: fixture.issueId, taskId: fixture.issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+    expect(ordinary).toMatchObject({ status: "queued", retryOfRunId: null });
+    await expectRejectedWithoutSideEffects(fixture, ordinary!);
+  });
+
+  it("parallel ordinary wake and exact retry never yield an unlinked retry execution", async () => {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const fixture = await seed();
+      const [ordinary, retry] = await Promise.allSettled([
+        heartbeat.wakeup(fixture.agentId, {
+          source: "on_demand",
+          triggerDetail: "manual",
+          reason: "issue_assigned",
+          payload: { issueId: fixture.issueId, taskId: fixture.issueId },
+          contextSnapshot: { issueId: fixture.issueId, taskId: fixture.issueId, wakeReason: "issue_assigned" },
+          requestedByActorType: "user",
+          requestedByActorId: "local-board",
+        }),
+        boardRetry(fixture, fixture.failedRunId),
+      ]);
+      expect(ordinary.status).toBe("fulfilled");
+      if (retry.status === "fulfilled") {
+        // Retry admitted first: it is the one linked successor; the ordinary
+        // wake was then admitted behind or into it by the usual policy.
+        expect(retry.value?.retryOfRunId).toBe(fixture.failedRunId);
+      } else {
+        expect(retry.reason).toMatchObject({ status: 409, details: { code: "failed_run_retry_issue_busy" } });
+      }
+      expect((await retryWakeRows()).filter((row) => row.status === "deferred_issue_execution")).toEqual([]);
+      expect((await successors(fixture.failedRunId)).length).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("still adopts the existing successor idempotently while the issue is busy", async () => {
+    const fixture = await seed();
+    const scheduled = await heartbeat.scheduleBoundedRetry(fixture.failedRunId, { now: new Date(), random: () => 0 });
+    if (scheduled.outcome !== "scheduled" || !scheduled.run) throw new Error("Expected native successor");
+    await unrelatedExecution(fixture, { status: "running", agentId: fixture.otherAgentId, holdsLock: true });
+    const before = await counts();
+
+    const first = await boardRetry(fixture, fixture.failedRunId);
+    const second = await boardRetry(fixture, fixture.failedRunId);
+
+    expect([first?.id, second?.id]).toEqual([scheduled.run.id, scheduled.run.id]);
+    expect(await counts()).toEqual(before);
+  });
+
+  it("exact retry first: the max-turn lane adds no second successor", async () => {
+    const fixture = await seed({ issueStatus: "in_progress" });
+    const ours = await boardRetry(fixture, fixture.failedRunId);
+    expect(ours).toMatchObject({ retryOfRunId: fixture.failedRunId });
+    await heartbeat.scheduleBoundedRetry(fixture.failedRunId, {
+      now: new Date(),
+      random: () => 0,
+      retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+      wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+      maxAttempts: 2,
+      delayMs: 0,
+    });
+    expect((await successors(fixture.failedRunId)).map((row) => row.id)).toEqual([ours!.id]);
   });
 });

@@ -9,7 +9,11 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
  * admission (`failedRunId` + `retry_failed_run`) locks the issue and the
  * failed run, then replays ANY existing successor of that run for the same
  * company and agent (native `scheduled_retry`, queued, running or terminal)
- * without a new run or wake; another agent's successor is a conflict. The
+ * without a new run or wake; another agent's successor is a conflict. With no
+ * successor, unrelated execution of the issue (the lock holder or any queued,
+ * running or scheduled run of it, any agent) is a 409
+ * `failed_run_retry_issue_busy` before any write: the retry is never
+ * coalesced into that run nor deferred and later promoted unlinked. The
  * automatic schedulers take the same row locks and adopt, or do not add
  * beside, an existing successor.
  */

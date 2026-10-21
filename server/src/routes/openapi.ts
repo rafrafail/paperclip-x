@@ -3647,7 +3647,7 @@ registry.registerPath({
   tags: ["agents"],
   summary: "Wake up an agent",
   description:
-    "Board failed-run retries supply failedRunId with reason retry_failed_run. Paperclip derives the exact request and current authorization; a chat retry may return a durable queued/deferred receipt before a run exists. Caller task/comment markers and fresh-session overrides do not authorize replay. A failed run has at most one retry successor: if one already exists for this agent (native scheduled, queued, running or finished), that run is returned with no new run or wake; another agent's successor is a 409. Detailed GET /api/health advertises this as features.failedRunRetrySuccessorReplay.",
+    "Board failed-run retries supply failedRunId with reason retry_failed_run. Paperclip derives the exact request and current authorization; a chat retry may return a durable queued/deferred receipt before a run exists. Caller task/comment markers and fresh-session overrides do not authorize replay. A failed run has at most one retry successor: if one already exists for this agent (native scheduled, queued, running or finished), that run is returned with no new run or wake; another agent's successor is a 409. With no successor, other live execution of the task is a 409 failed_run_retry_issue_busy and nothing is queued or deferred. Detailed GET /api/health advertises this as features.failedRunRetrySuccessorReplay.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(wakeAgentSchema),

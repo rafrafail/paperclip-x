@@ -27344,6 +27344,33 @@ export function heartbeatService(
               });
             }
             if (successor) return { kind: "replayed" as const, run: successor };
+            // Unrelated execution owns the issue: refuse before any cancel,
+            // lock, coalesce or defer write. Coalescing would hand our request
+            // to that run, and a deferred wake would later be promoted without
+            // retryOfRunId, i.e. a second, unlinked execution. Same lookup as
+            // the admission below: the lock holder or any lazily locked
+            // execution-path run of this issue.
+            const [busy] = await tx
+              .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, agentId: heartbeatRuns.agentId })
+              .from(heartbeatRuns)
+              .where(and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+                or(
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                  issue.executionRunId ? eq(heartbeatRuns.id, issue.executionRunId) : sql`false`,
+                ),
+              ))
+              .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+              .limit(1);
+            if (busy) {
+              throw conflict("The task is already executing other work; this failed run was not retried.", {
+                code: "failed_run_retry_issue_busy",
+                activeRunId: busy.id,
+                activeRunStatus: busy.status,
+                activeRunAgentId: busy.agentId,
+              });
+            }
           }
 
           let reconciledSourceRunId: string | null = null;
