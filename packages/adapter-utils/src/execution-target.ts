@@ -2832,12 +2832,15 @@ function nextProbeFileName() {
 // so this wrapper leaves that entry untouched instead of removing it. This
 // covers a peer's replacement file, a peer's replacement directory, and a
 // peer's replacement symbolic link alike, because all three change the
-// identity this wrapper reads back. The identity check includes ctimeMs,
-// not only (dev, ino): a filesystem can hand this call's freed inode number
-// straight back out to a peer's very next create at the same path, so
-// (dev, ino) alone can match a path this call no longer owns; ctimeMs resets
-// on every create, so a peer's replacement carries a different one even when
-// the inode number repeats. Node's filesystem API has no call that removes a
+// identity this wrapper reads back. That only holds while this call's inode
+// is still allocated. A filesystem such as ext4 hands a freed inode number
+// straight back out to a peer's very next create at the same path, and a
+// coarse file clock can give the replacement the same ctimeMs too, so a
+// closed probe would let a peer's entry match the identity read off it. This
+// call therefore keeps its probe descriptor open through the final identity
+// read and the removal call. An open descriptor keeps the inode allocated
+// even after a peer unlinks the path, so no peer entry can carry its
+// (dev, ino) while the check runs. Node's filesystem API has no call that removes a
 // path only when its identity still matches an earlier read as one atomic
 // step, so a gap remains between this wrapper's final identity read and the
 // removal call itself. A peer that wins this gap can put any entry at the
@@ -2867,17 +2870,18 @@ async function birthtimeSurvivesProbe(dirPath) {
   // the path in the gap between the create above and the stat: fstat has no
   // such gap, because a file descriptor keeps naming the inode it opened no
   // matter what a later swap does to the path.
+  // The descriptor stays open until cleanup is done; see the function
+  // comment above for why closing it first would let inode reuse fake
+  // ownership.
   let ownedIdentity = null;
   try {
     const createdStats = await handle.stat();
-    // ctimeMs guards against inode reuse; see the function comment above.
     ownedIdentity = { dev: createdStats.dev, ino: createdStats.ino, ctimeMs: createdStats.ctimeMs };
   } catch {
     ownedIdentity = null;
-  } finally {
-    await handle.close().catch(() => undefined);
   }
   if (!ownedIdentity) {
+    await handle.close().catch(() => undefined);
     // fstat on this call's own just-opened descriptor failed. This call then
     // has no verified identity for the probe file it created, so it must not
     // check or remove that file by path: a peer could already own the entry
@@ -2893,14 +2897,18 @@ async function birthtimeSurvivesProbe(dirPath) {
   // the probe path, including a pre-existing file it renames into place,
   // and the removal call below removes whatever entry is there when it
   // runs.
-  const currentStats = await fs.lstat(probePath).catch(() => null);
-  const stillOwned =
-    currentStats !== null &&
-    currentStats.dev === ownedIdentity.dev &&
-    currentStats.ino === ownedIdentity.ino &&
-    currentStats.ctimeMs === ownedIdentity.ctimeMs;
-  if (stillOwned) {
-    await fs.rm(probePath, { force: true }).catch(() => undefined);
+  try {
+    const currentStats = await fs.lstat(probePath).catch(() => null);
+    const stillOwned =
+      currentStats !== null &&
+      currentStats.dev === ownedIdentity.dev &&
+      currentStats.ino === ownedIdentity.ino &&
+      currentStats.ctimeMs === ownedIdentity.ctimeMs;
+    if (stillOwned) {
+      await fs.rm(probePath, { force: true }).catch(() => undefined);
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
   }
   let after;
   try {

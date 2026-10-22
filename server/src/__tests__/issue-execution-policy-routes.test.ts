@@ -278,6 +278,9 @@ describe("issue execution policy routes", () => {
       title: "Concurrent policy update",
       executionPolicy: null,
       executionState: null,
+      // Agents may only complete the execution run they own, with a passed
+      // handoff; the locked review policy is what must refuse this verdict.
+      executionRunId: "55555555-5555-4555-8555-555555555555",
     };
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.getByIdForUpdate.mockResolvedValue({
@@ -292,7 +295,7 @@ describe("issue execution policy routes", () => {
       runId: "55555555-5555-4555-8555-555555555555",
     }))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-      .send({ status: "done" });
+      .send({ status: "done", terminalHandoff: { outcome: "passed", summary: "Agent finished the run." } });
 
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({
@@ -304,6 +307,44 @@ describe("issue execution policy routes", () => {
     expect(mockDb.transaction).toHaveBeenCalled();
     expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent completing an execution run it does not own, even with a passed handoff", async () => {
+    // Same agent, run and run row as the under-lock verdict test above, which
+    // passes this guard and is refused later by the review policy. Only the
+    // issue's executionRunId differs, so the run-ownership check decides.
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      reviewPolicy: "anyone",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1002",
+      title: "Foreign execution run",
+      executionPolicy: null,
+      executionState: null,
+      executionRunId: "66666666-6666-4666-8666-666666666666",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "done", terminalHandoff: { outcome: "passed", summary: "Agent finished the run." } });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "Agents may only complete the issue execution run they own" });
+    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(mockIssueService.getByIdForUpdate).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("rejects an agent-authored in_review transition without a review path", async () => {

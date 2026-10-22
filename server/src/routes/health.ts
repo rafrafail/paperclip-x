@@ -35,6 +35,7 @@ import {
   WORKSPACE_READINESS_USER_ID_HEADER,
 } from "../auth/workspace-login-handoff.js";
 import { serverVersion } from "../version.js";
+import { FAILED_RUN_RETRY_SUCCESSOR_REPLAY_VERSION } from "../services/failed-run-retry-successor.js";
 import { getStartupRecoveryState } from "../startup-recovery-state.js";
 import { nativeRestartRecoverySummary } from "../services/native-runtime/native-restart-recovery.js";
 import {
@@ -422,6 +423,9 @@ export function healthRoutes(
       bootstrapInviteActive,
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
+        // Versioned server contract external retry owners must require
+        // before sending an exact failed-run retry (see the constant).
+        failedRunRetrySuccessorReplay: FAILED_RUN_RETRY_SUCCESSOR_REPLAY_VERSION,
       },
       serverInfo,
       startupRecovery,
