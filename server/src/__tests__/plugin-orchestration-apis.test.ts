@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentRuntimeState,
   agentWakeupRequests,
   agents,
   approvals,
@@ -119,6 +120,9 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await db.delete(projects);
     await db.delete(plugins);
     await db.delete(companyMemberships);
+    // An executed wake run leaves the agent's runtime state behind; the drain
+    // above has already settled every run that could still write it.
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -925,17 +929,33 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
 
     const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
 
-    // Hold a row lock on the issue so createComment's own `UPDATE issues SET
-    // updated_at` (inside addComment) blocks until this transaction commits a
-    // concurrent cancellation. That deterministically reproduces "another
-    // request closes the issue while the comment is being written" — the
-    // race Greptile flagged on the pre-insert `issue` snapshot — without
-    // relying on timing luck for the outcome, only for scheduling.
+    // Hold the issue row lock so the comment fence inside addComment (a
+    // SELECT ... FOR UPDATE on the issue) blocks until this transaction
+    // commits a concurrent cancellation. Explicit handshakes order the steps
+    // instead of sleeps: the lock is held before createComment starts, the
+    // cancellation is written only after createComment is seen waiting on
+    // that lock, and so it commits before the post-comment wake decision.
+    let markLockHeld!: (pid: number) => void;
+    const lockHeld = new Promise<number>((resolve) => {
+      markLockHeld = resolve;
+    });
+    let releaseCancel!: () => void;
+    const cancelGate = new Promise<void>((resolve) => {
+      releaseCancel = resolve;
+    });
     const lockAndCancelPromise = db.transaction(async (tx) => {
+      const [{ pid }] = (await tx.execute(sql`select pg_backend_pid() as pid`)) as unknown as Array<{ pid: number }>;
       await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      markLockHeld(pid);
+      await cancelGate;
       await tx.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
     });
+    const lockerPid = await Promise.race([
+      lockHeld,
+      lockAndCancelPromise.then(() => {
+        throw new Error("The cancelling transaction ended before it held the issue lock.");
+      }),
+    ]);
 
     const commentPromise = services.issues.createComment({
       issueId,
@@ -943,6 +963,29 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       body: "Here's my answer",
       actorUserId: humanUserId,
     });
+    void commentPromise.catch(() => undefined);
+
+    try {
+      // createComment reads the issue before addComment's fence, so a backend
+      // blocked by the locker on that fence proves the initial read already
+      // ran, and ran while the issue was still open.
+      const deadline = Date.now() + 5_000;
+      let blockedOnFence = false;
+      while (!blockedOnFence && Date.now() < deadline) {
+        const waiting = (await db.execute(sql`
+          select query from pg_stat_activity
+          where ${lockerPid}::int = any(pg_blocking_pids(pid))
+        `)) as unknown as Array<{ query: string }>;
+        blockedOnFence = waiting.some(({ query }) => query.includes('from "issues"') && query.includes("for update"));
+        if (!blockedOnFence) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(blockedOnFence, "createComment never waited on the issue fence held by the cancelling transaction").toBe(true);
+      const [openIssue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(openIssue?.status).toBe("in_review");
+    } finally {
+      releaseCancel();
+      await Promise.allSettled([commentPromise, lockAndCancelPromise]);
+    }
 
     const [comment] = await Promise.all([commentPromise, lockAndCancelPromise]);
 
@@ -951,6 +994,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       authorUserId: humanUserId,
       body: "Here's my answer",
     });
+    const [closedIssue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(closedIssue?.status).toBe("cancelled");
     await expect(db.select().from(agentWakeupRequests)).resolves.toHaveLength(0);
   });
 
